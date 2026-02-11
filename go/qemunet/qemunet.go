@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"container/list"
+	"context"
 	"crypto/rand"
 	"crypto/rsa"
 	"crypto/sha256"
@@ -17,6 +18,7 @@ import (
 	"io"
 	"math/big"
 	"net"
+	"net/http"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -30,9 +32,9 @@ import (
 )
 
 const (
-	maxHTTPRedirects      = 10
-	maxHTTPHeaderBytes    = 64 * 1024
-	MAX_HTTP_PIPELINE_BYTES = 64 * 1024
+	maxHTTPRedirects            = 10
+	maxHTTPHeaderBytes          = 64 * 1024
+	MAX_HTTP_PIPELINE_BYTES     = 64 * 1024
 	maxHTTPChunkedOverheadBytes = 256 * 1024
 )
 
@@ -54,9 +56,9 @@ const (
 )
 
 const (
-	defaultDnsMode              = DnsModeSynthetic
-	defaultSyntheticDnsIPv4     = "192.0.2.1"
-	defaultSyntheticDnsIPv6     = "2001:db8::1"
+	defaultDnsMode                = DnsModeSynthetic
+	defaultSyntheticDnsIPv4       = "192.0.2.1"
+	defaultSyntheticDnsIPv6       = "2001:db8::1"
 	defaultSyntheticDnsTtlSeconds = 60
 )
 
@@ -84,11 +86,11 @@ func NewHttpRequestBlockedError(message string, status int, statusText string) *
 }
 
 type HttpAllowInfo struct {
-	Hostname  string
-	IP        string
-	Family    int
-	Port      int
-	Protocol  string // "http" | "https"
+	Hostname string
+	IP       string
+	Family   int
+	Port     int
+	Protocol string // "http" | "https"
 }
 
 type HttpHookRequest struct {
@@ -106,16 +108,16 @@ type HttpHookResponse struct {
 }
 
 type HttpHooks struct {
-	IsAllowed func(info HttpAllowInfo) (bool, error)
-	OnRequest func(req HttpHookRequest) (*HttpHookRequest, error)
+	IsAllowed  func(info HttpAllowInfo) (bool, error)
+	OnRequest  func(req HttpHookRequest) (*HttpHookRequest, error)
 	OnResponse func(resp HttpHookResponse, req HttpHookRequest) (*HttpHookResponse, error)
 }
 
 type DnsOptions struct {
-	Mode              DnsMode
-	TrustedServers    []string
-	SyntheticIPv4     string
-	SyntheticIPv6     string
+	Mode                DnsMode
+	TrustedServers      []string
+	SyntheticIPv4       string
+	SyntheticIPv6       string
 	SyntheticTtlSeconds uint32
 }
 
@@ -147,16 +149,24 @@ type UdpSocket interface {
 type QemuNetworkOptions struct {
 	SocketPath string
 	Debug      bool
-	Dns        DnsOptions
-	Fetch      HttpFetch
-	HttpHooks  HttpHooks
-	MitmCertDir string
-	MaxHttpBodyBytes int
-	MaxHttpResponseBodyBytes int
-	MaxTCPPendingWriteBytes int
+
+	// Optional netstack address/macs (defaults match TS backend values)
+	GatewayIP       string
+	VmIP            string
+	GatewayMac      []byte
+	VmMac           []byte
+	TxQueueMaxBytes int
+
+	Dns                       DnsOptions
+	Fetch                     HttpFetch
+	HttpHooks                 HttpHooks
+	MitmCertDir               string
+	MaxHttpBodyBytes          int
+	MaxHttpResponseBodyBytes  int
+	MaxTCPPendingWriteBytes   int
 	TlsContextCacheMaxEntries int
-	TlsContextCacheTtlMs *int
-	UdpSocketFactory func() UdpSocket
+	TlsContextCacheTtlMs      *int
+	UdpSocketFactory          func() UdpSocket
 }
 
 type tcpSession struct {
@@ -165,11 +175,11 @@ type tcpSession struct {
 }
 
 type udpSession struct {
-	Socket UdpSocket
-	SrcIP   string
-	SrcPort uint16
-	DstIP   string
-	DstPort uint16
+	Socket       UdpSocket
+	SrcIP        string
+	SrcPort      uint16
+	DstIP        string
+	DstPort      uint16
 	UpstreamIP   string
 	UpstreamPort int
 }
@@ -185,21 +195,21 @@ type stackTcpError interface {
 type QemuNetworkBackend struct {
 	options QemuNetworkOptions
 
-	dnsMode DnsMode
+	dnsMode           DnsMode
 	trustedDnsServers []string
-	trustedDnsIndex int
+	trustedDnsIndex   int
 
 	syntheticDnsOpts gondolindns.SyntheticDnsResponseOptions
 
 	udpSessions map[string]*udpSession
 	tcpSessions map[string]*tcpSession
 
-	maxHttpBodyBytes int
+	maxHttpBodyBytes         int
 	maxHttpResponseBodyBytes int
-	maxTcpPendingWriteBytes int
+	maxTcpPendingWriteBytes  int
 
 	// Hooks and fetch
-	fetch HttpFetch
+	fetch     HttpFetch
 	httpHooks HttpHooks
 
 	// resolveHostname is overridable for tests.
@@ -207,15 +217,15 @@ type QemuNetworkBackend struct {
 
 	// tls MITM
 	mitmCertDir string
-	mitmMu sync.Mutex
-	mitmCa *mitm.MitmCa
+	mitmMu      sync.Mutex
+	mitmCa      *mitm.MitmCa
 
-	tlsCacheMu sync.Mutex
+	tlsCacheMu         sync.Mutex
 	tlsCacheMaxEntries int
-	tlsCacheTtl time.Duration
+	tlsCacheTtl        time.Duration
 	// map key -> list element for LRU
 	tlsCache map[string]*list.Element
-	tlsLru *list.List
+	tlsLru   *list.List
 
 	// injectable for tests
 	createTlsContext func(servername string) (*tls.Config, error)
@@ -227,7 +237,7 @@ type QemuNetworkBackend struct {
 
 type tlsCacheEntry struct {
 	Servername string
-	Config *tls.Config
+	Config     *tls.Config
 	LastAccess time.Time
 }
 
@@ -277,28 +287,33 @@ func NewQemuNetworkBackend(options QemuNetworkOptions) (*QemuNetworkBackend, err
 		cacheTtl = time.Duration(*options.TlsContextCacheTtlMs) * time.Millisecond
 	}
 
+	fetch := options.Fetch
+	if fetch == nil {
+		fetch = defaultHttpFetch
+	}
+
 	backend := &QemuNetworkBackend{
-		options: options,
-		dnsMode: mode,
+		options:           options,
+		dnsMode:           mode,
 		trustedDnsServers: trusted,
-		trustedDnsIndex: 0,
+		trustedDnsIndex:   0,
 		syntheticDnsOpts: gondolindns.SyntheticDnsResponseOptions{
-			IPv4: synthIPv4,
-			IPv6: synthIPv6,
+			IPv4:       synthIPv4,
+			IPv6:       synthIPv6,
 			TtlSeconds: ttl,
 		},
-		udpSessions: map[string]*udpSession{},
-		tcpSessions: map[string]*tcpSession{},
-		maxHttpBodyBytes: maxBody,
+		udpSessions:              map[string]*udpSession{},
+		tcpSessions:              map[string]*tcpSession{},
+		maxHttpBodyBytes:         maxBody,
 		maxHttpResponseBodyBytes: maxRespBody,
-		maxTcpPendingWriteBytes: maxPending,
-		fetch: options.Fetch,
-		httpHooks: options.HttpHooks,
-		mitmCertDir: mitm.ResolveMitmCertDir(options.MitmCertDir),
-		tlsCacheMaxEntries: cacheMax,
-		tlsCacheTtl: cacheTtl,
-		tlsCache: map[string]*list.Element{},
-		tlsLru: list.New(),
+		maxTcpPendingWriteBytes:  maxPending,
+		fetch:                    fetch,
+		httpHooks:                options.HttpHooks,
+		mitmCertDir:              mitm.ResolveMitmCertDir(options.MitmCertDir),
+		tlsCacheMaxEntries:       cacheMax,
+		tlsCacheTtl:              cacheTtl,
+		tlsCache:                 map[string]*list.Element{},
+		tlsLru:                   list.New(),
 	}
 
 	backend.resolveHostname = backend.defaultResolveHostname
@@ -323,6 +338,60 @@ func normalizeIpv4Servers(servers []string) []string {
 		unique = append(unique, s)
 	}
 	return unique
+}
+
+func defaultHttpFetch(rawURL string, init HttpFetchInit) (*HttpFetchResponse, error) {
+	method := init.Method
+	if method == "" {
+		method = "GET"
+	}
+
+	var body io.Reader
+	if len(init.Body) > 0 {
+		body = bytes.NewReader(init.Body)
+	}
+
+	req, err := http.NewRequest(method, rawURL, body)
+	if err != nil {
+		return nil, err
+	}
+	for k, v := range init.Headers {
+		req.Header.Set(k, v)
+	}
+
+	client := &http.Client{
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+	}
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+
+	statusText := ""
+	if resp.Status != "" {
+		parts := strings.SplitN(resp.Status, " ", 2)
+		if len(parts) == 2 {
+			statusText = parts[1]
+		}
+	}
+	if statusText == "" {
+		statusText = http.StatusText(resp.StatusCode)
+	}
+
+	headers := map[string][]string{}
+	for k, vals := range resp.Header {
+		headers[k] = append([]string(nil), vals...)
+	}
+
+	return &HttpFetchResponse{
+		Status:     resp.StatusCode,
+		StatusText: statusText,
+		Headers:    headers,
+		Body:       resp.Body,
+	}, nil
 }
 
 // -------------------- HTTP parsing --------------------
@@ -537,13 +606,13 @@ func decodeChunked(buf []byte, maxBody int) (decoded []byte, consumed int, compl
 // -------------------- Hop-by-hop headers --------------------
 
 var hopByHopHeaders = map[string]struct{}{
-	"connection":       {},
-	"keep-alive":       {},
-	"proxy-connection": {},
+	"connection":        {},
+	"keep-alive":        {},
+	"proxy-connection":  {},
 	"transfer-encoding": {},
-	"te":               {},
-	"trailer":          {},
-	"upgrade":          {},
+	"te":                {},
+	"trailer":           {},
+	"upgrade":           {},
 }
 
 func (b *QemuNetworkBackend) stripHopByHopHeaders(headers map[string]string) map[string]string {
@@ -592,9 +661,9 @@ type httpWriter struct {
 	finish func()
 }
 
-func (w httpWriter) Scheme() string { return w.scheme }
+func (w httpWriter) Scheme() string     { return w.scheme }
 func (w httpWriter) Write(chunk []byte) { w.write(chunk) }
-func (w httpWriter) Finish() { w.finish() }
+func (w httpWriter) Finish()            { w.finish() }
 
 func (b *QemuNetworkBackend) handleHttpDataWithWriter(key string, session *TcpIngressSession, data []byte, w httpWriter) error {
 	if session.HTTP == nil {
@@ -654,8 +723,8 @@ func (b *QemuNetworkBackend) handleHttpDataWithWriter(key string, session *TcpIn
 
 	// For now, we don't implement full keep-alive; close after one request.
 	_ = b.fetchAndRespond(parsed.Request, w.Scheme(), w.Write)
-		h.Closed = true
-		w.Finish()
+	h.Closed = true
+	w.Finish()
 	return nil
 }
 
@@ -733,7 +802,7 @@ func (b *QemuNetworkBackend) writeSimpleResponse(w httpWriter, version string, s
 // -------------------- Fetch and respond --------------------
 
 func (b *QemuNetworkBackend) defaultResolveHostname(hostname string) (string, int, error) {
-	ips, err := net.DefaultResolver.LookupIPAddr(nil, hostname)
+	ips, err := net.DefaultResolver.LookupIPAddr(context.Background(), hostname)
 	if err != nil || len(ips) == 0 {
 		return "", 0, err
 	}
@@ -1175,12 +1244,12 @@ func (b *QemuNetworkBackend) HandleUdpSend(msg UdpSendMessage) {
 		}
 
 		sess = &udpSession{
-			Socket: socket,
-			SrcIP: msg.SrcIP,
-			SrcPort: msg.SrcPort,
-			DstIP: msg.DstIP,
-			DstPort: msg.DstPort,
-			UpstreamIP: upstreamIP,
+			Socket:       socket,
+			SrcIP:        msg.SrcIP,
+			SrcPort:      msg.SrcPort,
+			DstIP:        msg.DstIP,
+			DstPort:      msg.DstPort,
+			UpstreamIP:   upstreamIP,
 			UpstreamPort: 53,
 		}
 		b.udpSessions[msg.Key] = sess
@@ -1188,10 +1257,10 @@ func (b *QemuNetworkBackend) HandleUdpSend(msg UdpSendMessage) {
 		socket.SetOnMessage(func(data []byte, _addr string, _port int) {
 			if b.stackUdp != nil {
 				b.stackUdp.HandleUdpResponse(map[string]any{
-					"data": append([]byte(nil), data...),
-					"srcIP": sess.SrcIP,
+					"data":    append([]byte(nil), data...),
+					"srcIP":   sess.SrcIP,
 					"srcPort": sess.SrcPort,
-					"dstIP": sess.DstIP,
+					"dstIP":   sess.DstIP,
 					"dstPort": sess.DstPort,
 				})
 			}
@@ -1222,10 +1291,10 @@ func (b *QemuNetworkBackend) handleSyntheticDns(msg UdpSendMessage) {
 	resp := gondolindns.BuildSyntheticDnsResponse(query, b.syntheticDnsOpts)
 	if b.stackUdp != nil {
 		b.stackUdp.HandleUdpResponse(map[string]any{
-			"data": resp,
-			"srcIP": msg.SrcIP,
+			"data":    resp,
+			"srcIP":   msg.SrcIP,
 			"srcPort": msg.SrcPort,
-			"dstIP": msg.DstIP,
+			"dstIP":   msg.DstIP,
 			"dstPort": msg.DstPort,
 		})
 	}
@@ -1432,12 +1501,12 @@ func (b *QemuNetworkBackend) defaultCreateTlsContext(servername string) (*tls.Co
 
 	tpl := &x509.Certificate{
 		SerialNumber: serial,
-		Subject: pkix.Name{CommonName: servername},
-		NotBefore: notBefore,
-		NotAfter: notAfter,
-		KeyUsage: x509.KeyUsageDigitalSignature | x509.KeyUsageKeyEncipherment,
-		ExtKeyUsage: []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
-		DNSNames: []string{servername},
+		Subject:      pkix.Name{CommonName: servername},
+		NotBefore:    notBefore,
+		NotAfter:     notAfter,
+		KeyUsage:     x509.KeyUsageDigitalSignature | x509.KeyUsageKeyEncipherment,
+		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+		DNSNames:     []string{servername},
 	}
 
 	der, err := x509.CreateCertificate(rand.Reader, tpl, ca.Cert, &leafKey.PublicKey, ca.Key)
@@ -1458,13 +1527,12 @@ func (b *QemuNetworkBackend) defaultCreateTlsContext(servername string) (*tls.Co
 	return &tls.Config{Certificates: []tls.Certificate{cert}}, nil
 }
 
-
 // -------------------- UDP socket impl --------------------
 
 type udpSocketImpl struct {
-	conn *net.UDPConn
+	conn      *net.UDPConn
 	onMessage func(data []byte, addr string, port int)
-	onError func(error)
+	onError   func(error)
 }
 
 func newUdpSocketImpl() *udpSocketImpl {
